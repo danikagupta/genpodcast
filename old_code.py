@@ -35,9 +35,8 @@ os.environ['LANGCHAIN_PROJECT']="gen-podcast"
 from langchain_openai import ChatOpenAI
 from langchain.output_parsers import PydanticOutputParser
 from langchain.prompts import ChatPromptTemplate, HumanMessagePromptTemplate, SystemMessagePromptTemplate
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 
-llmModel = ChatOpenAI(model="gpt-4o-mini", max_tokens=3000)
+llmModel = ChatOpenAI(model_name="gpt-4o-mini", max_tokens=3000)
 
 def read_readme():
     readme_path = Path("README.md")
@@ -279,12 +278,27 @@ STANDARD_VOICES = [
 
 class DialogueItem(BaseModel):
     text: str
-    speaker: Literal["speaker-1", "speaker-2", "speaker-3", "speaker-4"]
+    speaker: Literal["speaker-1", "speaker-2"]
 
 class Dialogue(BaseModel):
     scratchpad: str
     dialogue: List[DialogueItem]
 
+
+def get_mp3(text: str, voice: str, audio_model: str, api_key: str = None) -> bytes:
+    client = OpenAI(
+        api_key=st.secrets['OPENAI_API_KEY'],
+    )
+
+    with client.audio.speech.with_streaming_response.create(
+        model=audio_model,
+        voice=voice,
+        input=text,
+    ) as response:
+        with io.BytesIO() as file:
+            for chunk in response.iter_bytes():
+                file.write(chunk)
+            return file.getvalue()
         
 def conditional_llm(model, api_base=None, api_key=None):
     """
@@ -299,13 +313,14 @@ def conditional_llm(model, api_base=None, api_key=None):
             return llm(model=model, api_key=api_key)(func)
     return decorator
 
-def generate_transcript(
+def generate_audio(
     files: list,
     openai_api_key: str = None,
-    text_model: str = "gpt-4o-mini",  # Updated to use GPT-4 with LangChain
+    text_model: str = "gpt-4o-mini",
     audio_model: str = "tts-1",
     speaker_1_voice: str = "alloy",
     speaker_2_voice: str = "echo",
+    api_base: str = None,
     intro_instructions: str = '',
     text_instructions: str = '',
     scratch_pad_instructions: str = '',
@@ -326,54 +341,141 @@ def generate_transcript(
                 text = "\n\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
                 combined_text += text + "\n\n"
 
-    # Setup LangChain's OpenAI model
-    openai_llm = ChatOpenAI(model_name=text_model, openai_api_key=openai_api_key)
+    # Configure the LLM based on selected model and api_base
+    @retry(retry=retry_if_exception_type(ValidationError))
+    @conditional_llm(model=text_model, api_base=api_base, api_key=openai_api_key)
+    def generate_dialogue(text: str, intro_instructions: str, text_instructions: str, scratch_pad_instructions: str,
+                          prelude_dialog: str, podcast_dialog_instructions: str,
+                          edited_transcript: str = None, user_feedback: str = None, ) -> Dialogue:
+        """
+        {intro_instructions}
 
-    podcast_dict=INSTRUCTION_TEMPLATES['podcast']
-    intro_instructions=podcast_dict['intro']
-    text_instructions = podcast_dict['text_instructions']
-    scratch_pad_instructions = podcast_dict['scratch_pad']
-    prelude_dialog = podcast_dict['prelude']
-    podcast_dialog_instructions = podcast_dict['dialog']
-    #edited_transcript = podcast_dict['intro']
-    #user_feedback = podcast_dict['intro']
-    #original_text = podcast_dict['intro']
+        Here is the original input text:
 
-    # Construct the full prompt using LangChain's ChatPromptTemplate
-    prompts =  [
-        SystemMessage(content=intro_instructions),
-        HumanMessage(f"Here is the original input text:\n{combined_text}"),
-        HumanMessage(text_instructions),
-        HumanMessage(f"Brainstorm: {scratch_pad_instructions}"),
-        HumanMessage(f"Prelude: {prelude_dialog}"),
-        HumanMessage(f"Dialogue: {podcast_dialog_instructions}"),
-        HumanMessage(f"Edits: {edited_transcript if edited_transcript else ''}"),
-        HumanMessage(f"User feedback: {user_feedback if user_feedback else ''}")
-    ]
+        <input_text>
+        {text}
+        </input_text>
 
-    # Generate the dialogue using LangChain's OpenAI call
-    llm_output = openai_llm.with_structured_output(Dialogue).invoke(prompts)
+        {text_instructions}
 
-    # Process the response
-    generated_dialogue = llm_output.dialogue
+        <scratchpad>
+        {scratch_pad_instructions}
+        </scratchpad>
 
-    print(f"Generated dialogue: {generated_dialogue}")
+        {prelude_dialog}
+
+        <podcast_dialogue>
+        {podcast_dialog_instructions}
+        </podcast_dialogue>
+        {edited_transcript}{user_feedback}
+        """
+
+    instruction_improve='Based on the original text, please generate an improved version of the dialogue by incorporating the edits, comments and feedback.'
+    if edited_transcript:
+        edited_transcript_processed="\nPreviously generated edited transcript, with specific edits and comments that I want you to carefully address:\n"+"<edited_transcript>\n"+edited_transcript+"</edited_transcript>"
+    else:
+        edited_transcript_processed=""
+    if user_feedback:
+        user_feedback_processed="\nOverall user feedback:\n\n"+user_feedback
+    else:
+        user_feedback_processed=""
+
+    #edited_transcript_processed="\nPreviously generated edited transcript, with specific edits and comments that I want you to carefully address:\n"+"<edited_transcript>\n"+edited_transcript+"</edited_transcript>" if edited_transcript !="" else ""
+    #user_feedback_processed="\nOverall user feedback:\n\n"+user_feedback if user_feedback !="" else ""
+
+    if edited_transcript_processed.strip()!='' or user_feedback_processed.strip()!='':
+        user_feedback_processed="<requested_improvements>"+user_feedback_processed+"\n\n"+instruction_improve+"</requested_improvements>"
+
+    if debug:
+        logger.info (edited_transcript_processed)
+        logger.info (user_feedback_processed)
+
+    # Generate the dialogue using the LLM
+    llm_output = generate_dialogue(
+        combined_text,
+        intro_instructions=intro_instructions,
+        text_instructions=text_instructions,
+        scratch_pad_instructions=scratch_pad_instructions,
+        prelude_dialog=prelude_dialog,
+        podcast_dialog_instructions=podcast_dialog_instructions,
+        edited_transcript=edited_transcript_processed,
+        user_feedback=user_feedback_processed
+    )
 
     # Generate audio from the transcript
+    audio = b""
     transcript = ""
     characters = 0
-    for gd in generated_dialogue:
-        one_line=f"{gd.speaker}: {gd.text}"
-        characters += len(one_line)
-        transcript +=one_line+"\n\n"
+
+    with cf.ThreadPoolExecutor() as executor:
+        futures = []
+        for line in llm_output.dialogue:
+            transcript_line = f"{line.speaker}: {line.text}"
+            voice = speaker_1_voice if line.speaker == "speaker-1" else speaker_2_voice
+            future = executor.submit(get_mp3, line.text, voice, audio_model, openai_api_key)
+            futures.append((future, transcript_line))
+            characters += len(line.text)
+
+        for future, transcript_line in futures:
+            audio_chunk = future.result()
+            audio += audio_chunk
+            transcript += transcript_line + "\n\n"
 
     logger.info(f"Generated {characters} characters of audio")
-    return transcript, combined_text
 
-if st.button("Generate"):
-    os.environ['OPENAI_API_KEY']=st.secrets['OPENAI_API_KEY']
-    #audio_file, transcript, original_text=generate_audio(['/content/Counting_Rs.pdf'])
-    transcript, original_text=generate_transcript(['Testfile.pdf'])
-    #print(transcript)
-    st.write(transcript)
+    temporary_directory = "./gradio_cached_examples/tmp/"
+    os.makedirs(temporary_directory, exist_ok=True)
 
+    # Use a temporary file -- Gradio's audio component doesn't work with raw bytes in Safari
+    temporary_file = NamedTemporaryFile(
+        dir=temporary_directory,
+        delete=False,
+        suffix=".mp3",
+    )
+    temporary_file.write(audio)
+    temporary_file.close()
+
+    # Delete any files in the temp directory that end with .mp3 and are over a day old
+    for file in glob.glob(f"{temporary_directory}*.mp3"):
+        if os.path.isfile(file) and time.time() - os.path.getmtime(file) > 24 * 60 * 60:
+            os.remove(file)
+
+    return temporary_file.name, transcript, combined_text
+
+def validate_and_generate_audio(*args):
+    files = args[0]
+    if not files:
+        return None, None, None, "Please upload at least one PDF file before generating audio."
+    try:
+        audio_file, transcript, original_text = generate_audio(*args)
+        return audio_file, transcript, original_text, None  # Return None as the error when successful
+    except Exception as e:
+        # If an error occurs during generation, return None for the outputs and the error message
+        return None, None, None, str(e)
+
+def edit_and_regenerate(edited_transcript, user_feedback, *args):
+    # Replace the original transcript and feedback in the args with the new ones
+    new_args = list(args)
+    new_args[-2] = edited_transcript  # Update edited transcript
+    new_args[-1] = user_feedback  # Update user feedback
+    return validate_and_generate_audio(*new_args)
+
+# New function to handle user feedback and regeneration
+def process_feedback_and_regenerate(feedback, *args):
+    # Add user feedback to the args
+    new_args = list(args)
+    new_args.append(feedback)  # Add user feedback as a new argument
+    return validate_and_generate_audio(*new_args)
+
+os.environ['OPENAI_API_KEY']=st.secrets['OPENAI_API_KEY']
+#audio_file, transcript, original_text=generate_audio(['/content/Counting_Rs.pdf'])
+audio_file, transcript, original_text=generate_audio(['Testfile.pdf'])
+print(transcript)
+st.write(transcript)
+
+
+
+st.title("🎈 My new app")
+st.write(
+    "Let's start building! For help and inspiration, head over to [docs.streamlit.io](https://docs.streamlit.io/)."
+)

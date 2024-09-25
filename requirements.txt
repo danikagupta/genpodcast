@@ -1,1 +1,11 @@
 streamlit
+loguru
+promptic 
+pydantic 
+pypdf 
+tenacity 
+openai
+
+langchain
+langchain_community
+langchain_openai
