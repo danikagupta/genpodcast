@@ -300,7 +300,7 @@ def conditional_llm(model, api_base=None, api_key=None):
     return decorator
 
 def generate_transcript(
-    files: list,
+    file,
     openai_api_key: str = None,
     text_model: str = "gpt-4o-mini",  # Updated to use GPT-4 with LangChain
     audio_model: str = "tts-1",
@@ -316,15 +316,9 @@ def generate_transcript(
     original_text: str = None,
     debug = False,
 ) -> tuple:
-    combined_text = original_text or ""
-
-    # If there's no original text, extract it from the uploaded files
-    if not combined_text:
-        for file in files:
-            with Path(file).open("rb") as f:
-                reader = PdfReader(f)
-                text = "\n\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
-                combined_text += text + "\n\n"
+    
+    reader=PdfReader(file)
+    combined_text="\n\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
 
     # Setup LangChain's OpenAI model
     openai_llm = ChatOpenAI(model_name=text_model, openai_api_key=openai_api_key)
@@ -370,10 +364,13 @@ def generate_transcript(
     logger.info(f"Generated {characters} characters of audio")
     return transcript, combined_text
 
-if st.button("Generate"):
+st.markdown("# Upload file: PDF")
+uploaded_file=st.file_uploader("Upload PDF file",type="pdf")
+
+if uploaded_file is not None and st.button("Generate"):
     os.environ['OPENAI_API_KEY']=st.secrets['OPENAI_API_KEY']
-    #audio_file, transcript, original_text=generate_audio(['/content/Counting_Rs.pdf'])
-    transcript, original_text=generate_transcript(['Testfile.pdf'])
+    #transcript, original_text=generate_transcript(['Testfile.pdf'])
+    transcript, original_text=generate_transcript(uploaded_file)
     #print(transcript)
     st.write(transcript)
 
